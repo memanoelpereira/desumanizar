@@ -3,3 +3,5 @@ plotly
 pandas
 numpy
 pillow
+requests
+scipy

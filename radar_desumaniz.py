@@ -1,5 +1,4 @@
-# radar_desumaniz.py
-# VERSÃO INTEGRAL RESTAURADA - Correção de ValueError e Exibição 600px
+# enviado ///////////////////////////////////////////////////
 
 import numpy as np
 import pandas as pd
@@ -11,6 +10,9 @@ import base64
 import io
 import json
 import streamlit.components.v1 as components
+import requests
+import plotly.express as px
+from scipy.stats import entropy as scipy_entropy
 
 
 # =========================
@@ -125,6 +127,118 @@ def image_to_base64(img_path: Path, max_width: int = 300) -> str:
         return ""
 
 
+
+def compute_entropia_angular(theta_rad: np.ndarray, n_bins: int = 12) -> float:
+    """
+    Entropia de Shannon sobre bins angulares.
+    Alta entropia → discurso distribuído (orgânico).
+    Baixa entropia → concentrado (possível coordenação).
+    Retorna valor normalizado 0–1 (H / log(n_bins)).
+    """
+    theta_rad = np.asarray(theta_rad)
+    theta_rad = theta_rad[~np.isnan(theta_rad)] % (2 * np.pi)
+    if len(theta_rad) < 2:
+        return np.nan
+    counts, _ = np.histogram(theta_rad, bins=n_bins, range=(0, 2 * np.pi))
+    counts = counts[counts > 0]
+    if len(counts) == 0:
+        return np.nan
+    probs = counts / counts.sum()
+    h = -np.sum(probs * np.log(probs))
+    h_max = np.log(n_bins)
+    return float(h / h_max)
+
+
+def compute_deriva(df_autor: pd.DataFrame) -> pd.DataFrame:
+    """
+    Para cada autor com ≥2 posts, calcula o vetor de deriva entre posts consecutivos.
+    Retorna DataFrame com colunas: autor, id_from, id_to, delta_theta, delta_r, delta_dias.
+    """
+    rows = []
+    for autor, grp in df_autor.groupby("autor"):
+        grp = grp.sort_values("_dt").reset_index(drop=True)
+        if len(grp) < 2:
+            continue
+        for i in range(len(grp) - 1):
+            a, b = grp.iloc[i], grp.iloc[i + 1]
+            d_theta = float(b["_theta"] - a["_theta"])
+            # normaliza para [-π, π]
+            d_theta = (d_theta + np.pi) % (2 * np.pi) - np.pi
+            d_r = float(b["_r"] - a["_r"])
+            d_dias = (b["_dt"] - a["_dt"]).days if pd.notna(b["_dt"]) and pd.notna(a["_dt"]) else np.nan
+            rows.append({
+                "autor": autor,
+                "id_from": str(a["id"]),
+                "id_to": str(b["id"]),
+                "tipo_from": a["_tipo"],
+                "tipo_to": b["_tipo"],
+                "delta_theta_graus": round(np.degrees(d_theta), 1),
+                "delta_r": round(d_r, 3),
+                "delta_dias": d_dias,
+                "escalada": d_r < -0.05,   # aproxima-se do centro = mais intenso
+                "mudou_tipo": a["_tipo"] != b["_tipo"],
+            })
+    return pd.DataFrame(rows)
+
+
+
+CLASSIFY_PROMPT = """Você é um pesquisador especialista em teoria da desumanização.
+Classifique o discurso abaixo em UMA das categorias:
+
+- infra-humanização: o alvo é comparado a animais, seres primitivos ou desprovidos de cultura/razão
+- supra-humanização: o alvo é comparado a demônios, monstros sobrenaturais ou seres ameaçadores não-humanos
+- quase-desumanização: o alvo é tratado como objeto moral inferior sem metáfora animal/sobrenatural
+- outros: não se enquadra em nenhuma das categorias acima
+
+Título: {titulo} | Teoria: {teoria} | Categoria: {categoria}
+Texto: {texto}
+
+Responda APENAS em JSON válido:
+{{"tipo": "infra|supra|quase|outros", "justificativa": "...", "confianca": "alta|media|baixa"}}
+"""
+
+def _parse_llm(raw):
+    s, e = raw.find("{"), raw.rfind("}") + 1
+    if s == -1 or e == 0:
+        return {"tipo": "outros", "justificativa": "Resposta inválida.", "confianca": "baixa"}
+    try:
+        r = json.loads(raw[s:e])
+        if r.get("tipo") not in ["infra","supra","quase","outros"]: r["tipo"] = "outros"
+        return r
+    except Exception as ex:
+        return {"tipo": "outros", "justificativa": str(ex), "confianca": "baixa"}
+
+def classify_with_ollama(texto, titulo, teoria, categoria, url, model):
+    prompt = CLASSIFY_PROMPT.format(titulo=titulo, teoria=teoria, categoria=categoria, texto=texto)
+    try:
+        r = requests.post(f"{url.rstrip('/')}/api/generate",
+            json={"model": model, "prompt": prompt, "stream": False}, timeout=90)
+        r.raise_for_status()
+        return _parse_llm(r.json().get("response",""))
+    except requests.exceptions.ConnectionError:
+        return {"tipo": None, "justificativa": "❌ Ollama não encontrado.", "confianca": None}
+    except Exception as e:
+        return {"tipo": None, "justificativa": f"❌ {e}", "confianca": None}
+
+def classify_with_groq(texto, titulo, teoria, categoria, api_key, model):
+    prompt = CLASSIFY_PROMPT.format(titulo=titulo, teoria=teoria, categoria=categoria, texto=texto)
+    try:
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model, "messages": [{"role":"user","content":prompt}],
+                  "temperature": 0.1, "max_tokens": 400}, timeout=30)
+        r.raise_for_status()
+        return _parse_llm(r.json()["choices"][0]["message"]["content"])
+    except requests.exceptions.ConnectionError:
+        return {"tipo": None, "justificativa": "❌ Sem conexão com Groq.", "confianca": None}
+    except requests.exceptions.HTTPError:
+        code = r.status_code
+        msgs = {401: "❌ API key inválida.", 400: "❌ Modelo inválido (erro 400)."}
+        return {"tipo": None, "justificativa": msgs.get(code, f"❌ HTTP {code}"), "confianca": None}
+    except Exception as e:
+        return {"tipo": None, "justificativa": f"❌ {e}", "confianca": None}
+
+
 def parse_date_range(date_range, fallback_start, fallback_end):
     if isinstance(date_range, (list, tuple)):
         if len(date_range) == 2:
@@ -217,14 +331,13 @@ if "selected_id" not in st.session_state:
     st.session_state["selected_id"] = None
 
 with st.sidebar:
-    st.header("Dados")
-    up = st.file_uploader("Envie o CSV", type=["csv"])
-    sep = st.selectbox("Separador", [",", ";", "\t"], index=0)
-    enc = st.selectbox("Encoding", ["utf-8", "latin-1", "utf-8-sig"], index=0)
-
-    st.divider()
-    st.header("Imagens")
-    image_folder = Path(st.text_input("Pasta das imagens", value="imagens"))
+    # ── caminhos fixos no servidor ────────────────────────────────────────────
+    # Edite estas constantes conforme a estrutura do seu repositório.
+    CSV_PATH     = Path("dataset.csv")   # CSV na raiz do repositório
+    image_folder = Path("imagens")       # pasta de imagens na raiz do repositório
+    sep = ","
+    enc = "utf-8"
+    # ─────────────────────────────────────────────────────────────────────────
 
     st.divider()
     st.header("Ciclo do radar")
@@ -240,10 +353,30 @@ with st.sidebar:
     jitter_r = st.slider("Dispersão radial", 0.005, 0.10, 0.035, 0.005)
 
     st.divider()
+    st.header("Métricas de engajamento")
+    metrica_rep = st.selectbox("Métrica de repercussão",
+        ["IV — Índice de Viralização (likes/√seguidores)",
+         "IE — Engajamento Composto ((likes+coment+compart)/seguidores)",
+         "IA — Alcance Ponderado (visualizações × IV_norm)",
+         "IRD — Ressonância Desproporcional (likes/seg^α)"],
+        index=0)
+    ird_alpha = st.slider("α (expoente IRD)", 0.1, 1.0, 0.5, 0.05,
+        help="0.5 = equivale ao IV. Valores menores favorecem contas pequenas.") if metrica_rep.startswith("IRD") else 0.5
+    decay_lambda = st.slider("Decaimento temporal (λ)", 0.0, 0.05, 0.0, 0.005,
+        help="0=sem decaimento. 0.01→meia-vida ~70 dias.")
+
+    st.divider()
     st.header("Índice sintético")
-    w_int = st.slider("Peso: intensidade", 0.0, 1.0, 0.40, 0.05)
-    w_rep = st.slider("Peso: repercussão", 0.0, 1.0, 0.40, 0.05)
-    w_conc = st.slider("Peso: concentração", 0.0, 1.0, 0.20, 0.05)
+    w_int  = st.slider("Peso: intensidade",    0.0, 1.0, 0.40, 0.05)
+    w_rep  = st.slider("Peso: repercussão",    0.0, 1.0, 0.40, 0.05)
+    w_conc = st.slider("Peso: concentração",   0.0, 1.0, 0.20, 0.05)
+
+    st.divider()
+    st.header("Deriva por autor")
+    show_deriva_radar = st.checkbox("Mostrar deriva no radar", value=False,
+        help="Traça linhas conectando posts consecutivos do mesmo autor.")
+    entropia_bins = st.slider("Bins para entropia angular", 6, 24, 12, 2,
+        help="Número de fatias do ciclo para calcular a entropia de Shannon.")
 
     st.divider()
     st.header("Heatmap polar")
@@ -254,11 +387,11 @@ with st.sidebar:
     show_cloud = st.checkbox("Mostrar manchas", True)
     show_points = st.checkbox("Mostrar pontos-origem", True)
 
-if up is None:
-    st.info("Envie o CSV para iniciar.")
+if not CSV_PATH.exists():
+    st.error(f"Arquivo não encontrado: `{CSV_PATH.resolve()}`. Verifique o caminho em CSV_PATH no código.")
     st.stop()
 
-df0 = pd.read_csv(up, sep=sep, encoding=enc, dtype=str, engine="python").dropna(how="all").copy()
+df0 = pd.read_csv(CSV_PATH, sep=sep, encoding=enc, dtype=str, engine="python").dropna(how="all").copy()
 
 required_cols = ["id", "data", "autor", "seguidores", "titulo", "likes", "conteudo",
                  "replicas", "categoria", "ente", "teoria", "conflito", "imagem"]
@@ -283,10 +416,44 @@ if df.empty:
     st.error("Nenhuma data válida reconhecida. Confira o formato dd/mm/aaaa na coluna 'data'.")
     st.stop()
 
-df["_likes"] = df["likes"].apply(to_number)
+df["_likes"]      = df["likes"].apply(to_number)
 df["_seguidores"] = df["seguidores"].apply(to_number)
 
-df["_replicas_proxy"] = df["replicas"].fillna("").astype(str).str.len().replace(0, np.nan)
+def _col(name): return df[name].apply(to_number) if name in df.columns else pd.Series(0.0, index=df.index)
+df["_comentarios"]       = _col("comentarios")
+df["_compartilhamentos"] = _col("compartilhamentos")
+df["_visualizacoes"]     = _col("visualizacoes")
+
+# IV: Índice de Viralização = likes / √seguidores
+df["_iv_raw"] = df["_likes"].clip(lower=0) / np.sqrt(df["_seguidores"].clip(lower=1))
+
+# IE: Engajamento Composto
+engaj = df["_likes"].fillna(0) + df["_comentarios"].fillna(0) + df["_compartilhamentos"].fillna(0)
+df["_ie_raw"] = (engaj / df["_seguidores"].clip(lower=1)) * 100.0
+
+# IA: Alcance Ponderado = visualizações × IV_norm
+df["_ia_raw"] = df["_visualizacoes"].clip(lower=0) * robust_minmax(df["_iv_raw"]).fillna(0)
+
+# IRD: Ressonância Desproporcional = likes / seguidores^α
+df["_ird_raw"] = df["_likes"].clip(lower=0) / (df["_seguidores"].clip(lower=1) ** ird_alpha)
+
+# decaimento temporal opcional
+if decay_lambda > 0:
+    dias = (pd.Timestamp.now() - df["_dt"]).dt.days.clip(lower=0)
+    fator = np.exp(-decay_lambda * dias)
+    for col in ["_iv_raw","_ie_raw","_ia_raw","_ird_raw"]:
+        df[col] = df[col] * fator
+
+# métrica ativa
+_metric_map = {
+    "IV": ("_iv_raw", "IV — likes/√seg"),
+    "IE": ("_ie_raw", "IE — engaj. composto (%)"),
+    "IA": ("_ia_raw", "IA — alcance ponderado"),
+    "IRD": ("_ird_raw", f"IRD — ressonância (α={ird_alpha})"),
+}
+_key = next(k for k in _metric_map if metrica_rep.startswith(k))
+_rep_col, _rep_label = _metric_map[_key]
+df["_replicas_proxy"] = df[_rep_col]
 
 df["_tipo"] = [normalize_tipo(c, t) for c, t in zip(df["categoria"], df["teoria"])]
 
@@ -312,7 +479,7 @@ if df.empty:
     st.warning("Nada para plotar com os filtros atuais.")
     st.stop()
 
-df["_int_raw"] = np.log1p(df["_likes"].clip(lower=0)) - np.log1p(df["_seguidores"].clip(lower=0))
+df["_int_raw"] = np.log1p(df["_ie_raw"].clip(lower=0))
 df["_int01"] = robust_minmax(df["_int_raw"])
 df["_rep01"] = robust_minmax(df["_replicas_proxy"].clip(lower=0))
 
@@ -321,7 +488,7 @@ df["_r"] = radial_from_intensity(df["_int01"], inner=inner, outer=1.0)
 
 tickvals, ticktext, ciclo_label, unit_values = cycle_bins(cycle)
 
-tab_radar, tab_painel, tab_galeria = st.tabs(["Radar", "Painel Analítico", "Galeria Interativa"])
+tab_radar, tab_painel, tab_galeria, tab_classif = st.tabs(["Radar", "Painel Analítico", "Galeria Interativa", "🤖 Classificação Assistida"])
 
 with tab_radar:
     st.markdown("### Radar (seleção → imagem do `id` + metadados)")
@@ -425,6 +592,25 @@ with tab_radar:
                 name=f"Eventos: {t}",
                 customdata=customdata,
                 hoverinfo="none",
+            ))
+
+    # Deriva no radar: linhas conectando posts consecutivos do mesmo autor
+    if show_deriva_radar and "autor" in df.columns:
+        deriva_df = compute_deriva(df)
+        for autor_d, grp_d in df.groupby("autor"):
+            if len(grp_d) < 2:
+                continue
+            grp_d = grp_d.sort_values("_dt")
+            cor_d = TIPO_COLOR.get(grp_d.iloc[-1]["_tipo"], "#888888")
+            fig.add_trace(go.Scatterpolar(
+                theta=np.degrees(grp_d["_theta"].values),
+                r=grp_d["_r"].values,
+                mode="lines",
+                line=dict(color=cor_d, width=1.2, dash="dot"),
+                opacity=0.5,
+                name=f"Deriva: {autor_d}",
+                showlegend=False,
+                hoverinfo="skip",
             ))
 
     fig.update_layout(
@@ -567,17 +753,28 @@ with tab_painel:
         .reset_index(name="concentracao_circular")
     )
 
+    # Entropia angular por tipo
+    entropia_por_tipo = (
+        df.groupby("_tipo")["_theta"]
+        .apply(lambda s: compute_entropia_angular(s.values, n_bins=entropia_bins))
+        .reset_index(name="entropia_angular")
+    )
+
     resumo = (
         df.groupby("_tipo")
         .agg(
             eventos=("_dt", "count"),
-            intensidade_media=("_int_raw", "mean"),
-            replicas_proxy_total=("_replicas_proxy", "sum"),
+            iv_medio=("_iv_raw", "mean"),
+            ie_medio=("_ie_raw", "mean"),
+            ird_medio=("_ird_raw", "mean"),
+            likes_total=("_likes", "sum"),
+            repercussao_media=("_replicas_proxy", "mean"),
             int01_media=("_int01", "mean"),
             rep01_media=("_rep01", "mean"),
         )
         .reset_index()
         .merge(conc, on="_tipo", how="left")
+        .merge(entropia_por_tipo, on="_tipo", how="left")
     )
 
     wsum = max(1e-9, (w_int + w_rep + w_conc))
@@ -587,8 +784,122 @@ with tab_painel:
         (w_conc / wsum) * resumo["concentracao_circular"].fillna(0)
     )
 
-    st.dataframe(resumo.sort_values("eventos", ascending=False), width="stretch")
-    st.download_button("Baixar resumo (CSV)", resumo.to_csv(index=False).encode("utf-8"), "resumo_por_tipo.csv", "text/csv")
+    resumo_display = resumo.rename(columns={
+        "_tipo": "tipo",
+        "iv_medio": "IV médio",
+        "ie_medio": "IE médio (%)",
+        "ird_medio": f"IRD médio (α={ird_alpha})",
+        "likes_total": "likes total",
+        "repercussao_media": f"repercussão ({_rep_label})",
+        "concentracao_circular": "concentração (R̄)",
+        "entropia_angular": "entropia angular (H)",
+        "indice_sintetico_0a100": "índice sintético (0–100)",
+    })
+
+    st.caption(f"Métrica ativa: **{_rep_label}**  |  λ={decay_lambda}  |  bins entropia={entropia_bins}")
+    st.dataframe(resumo_display.sort_values("eventos", ascending=False), width="stretch")
+
+    # gráficos comparativos
+    col_b1, col_b2, col_b3 = st.columns(3)
+    CMAP = {"infra":"#e74c3c","supra":"#9b59b6","quase":"#f39c12","outros":"#2ecc71"}
+    with col_b1:
+        fig_iv = px.bar(resumo, x="_tipo", y="iv_medio", color="_tipo",
+            title="IV médio (viralização)", labels={"_tipo":"tipo","iv_medio":"IV"},
+            color_discrete_map=CMAP)
+        fig_iv.update_layout(showlegend=False, height=280)
+        st.plotly_chart(fig_iv, key="bar_iv")
+    with col_b2:
+        fig_ent = px.bar(resumo, x="_tipo", y="entropia_angular", color="_tipo",
+            title="Entropia angular (H)", labels={"_tipo":"tipo","entropia_angular":"H (0–1)"},
+            color_discrete_map=CMAP)
+        fig_ent.update_layout(showlegend=False, height=280, yaxis_range=[0,1])
+        st.plotly_chart(fig_ent, key="bar_ent")
+    with col_b3:
+        fig_conc = px.bar(resumo, x="_tipo", y="concentracao_circular", color="_tipo",
+            title="Concentração temporal (R̄)", labels={"_tipo":"tipo","concentracao_circular":"R̄"},
+            color_discrete_map=CMAP)
+        fig_conc.update_layout(showlegend=False, height=280, yaxis_range=[0,1])
+        st.plotly_chart(fig_conc, key="bar_conc")
+
+    st.download_button("⬇️ Baixar resumo por tipo (CSV)",
+        resumo_display.to_csv(index=False).encode("utf-8"), "resumo_por_tipo.csv", "text/csv")
+
+    # ── dicionário de métricas ────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### 📖 Dicionário de métricas")
+    st.markdown("""
+#### Métricas de engajamento
+
+**IV — Índice de Viralização**
+- **Fórmula:** `likes / √seguidores`
+- **Operacionalização:** divide likes pela raiz quadrada dos seguidores. A raiz quadrada corrige o viés de escala das redes sociais (lei de potência): uma conta 4× maior não produz 4× mais engajamento esperado, mas ~2× (Bakshy et al., 2012).
+- **Interpretação:** valores altos = repercussão desproporcional ao tamanho da audiência. Compare relativamente entre tipos e eventos, não em termos absolutos.
+
+---
+
+**IE — Índice de Engajamento Composto**
+- **Fórmula:** `(likes + comentários + compartilhamentos) / seguidores × 100`
+- **Operacionalização:** soma todas as formas de interação e divide pelo alcance potencial. Resultado em percentual.
+- **Interpretação:** taxas >3–5% são consideradas altas em redes sociais (Hootsuite, 2023). Valores muito altos (>20%) podem indicar campanhas coordenadas ou nichos muito engajados.
+
+---
+
+**IA — Índice de Alcance Ponderado**
+- **Fórmula:** `visualizações × IV_normalizado`
+- **Operacionalização:** combina alcance bruto (visualizações) com qualidade do engajamento (IV normalizado 0–1 por min-max robusto).
+- **Interpretação:** alto IA = simultaneamente muito visto e muito viral. Requer coluna `visualizacoes` no CSV.
+
+---
+
+**IRD — Índice de Ressonância Desproporcional**
+- **Fórmula:** `likes / seguidores^α`  (α ajustável no sidebar, padrão 0.5)
+- **Operacionalização:** generaliza o IV com expoente α configurável. α=0.5 equivale ao IV. Valores de α menores (ex: 0.3) penalizam mais fortemente contas grandes, favorecendo a detecção de viralidade em contas pequenas — útil para identificar discursos que ressoam organicamente em nichos antes de atingir grandes influenciadores.
+- **Interpretação:** IRD alto em conta pequena = o estereótipo ressoa organicamente na base; IRD alto em conta grande = amplificação institucionalizada. Compare os dois perfis para distinguir origem da viralidade de sua amplificação.
+
+---
+
+#### Métricas temporais
+
+**Concentração temporal (R̄ — comprimento do vetor médio circular)**
+- **Fórmula:** `√(mean(cos θ)² + mean(sin θ)²)`
+- **Operacionalização:** estatística circular de Fisher (1993). θ é o ângulo do post no ciclo escolhido (dia/semana/mês/ano).
+- **Interpretação:** R̄ → 0 = discursos distribuídos uniformemente no ciclo (sem padrão temporal). R̄ → 1 = forte concentração num mesmo período. Valores >0.5 merecem atenção interpretativa.
+
+---
+
+**Entropia Angular (H)**
+- **Fórmula:** `−Σ pₖ log(pₖ) / log(n_bins)` sobre bins angulares do ciclo
+- **Operacionalização:** divide o ciclo em n_bins fatias iguais, calcula a distribuição dos posts por fatia e aplica entropia de Shannon, normalizada pelo máximo teórico (log n_bins) para escala 0–1.
+- **Interpretação:** H → 1 = distribuição uniforme ao longo do ciclo → padrão **orgânico** (posts em qualquer horário/dia). H → 0 = concentração extrema em poucos bins → padrão **coordenado** ou reativo (posts em horários/dias específicos). Use em conjunto com R̄: alta concentração (R̄↑) + baixa entropia (H↓) é o sinal mais forte de coordenação.
+
+---
+
+#### Deriva por autor
+
+**Δθ — Deriva angular**
+- **Fórmula:** diferença circular entre ângulos de posts consecutivos do mesmo autor, normalizada para [−180°, +180°]
+- **Interpretação:** Δθ ≈ 0 = autor mantém o mesmo padrão horário/semanal. |Δθ| grande = mudança de período de publicação entre posts — pode indicar adaptação de estratégia ou perfil de conta com uso irregular.
+
+**Δr — Deriva radial (escalada de intensidade)**
+- **Fórmula:** diferença de raio entre posts consecutivos (r₂ − r₁)
+- **Interpretação:** Δr < 0 = post mais recente está mais próximo do centro = **escalada** (maior engajamento). Δr > 0 = desescalada. Autores com Δr sistematicamente negativo ao longo do tempo apresentam **trajetória de escalada** — intensificação progressiva do discurso de desumanização.
+
+**Mudança de tipo**
+- Indica se o autor transitou entre categorias (ex: de quase-desumanização para infra-humanização). Transições para tipos mais extremos (quase → infra ou supra) são teoricamente relevantes como indicadores de radicalização discursiva.
+
+---
+
+#### Índice Sintético (0–100)
+- **Fórmula:** `100 × (w₁·intensidade + w₂·repercussão + w₃·concentração) / (w₁+w₂+w₃)`
+- **Interpretação:** instrumento de **comparação relativa** dentro do corpus — não é uma medida absoluta de desumanização. Reporte sempre os pesos utilizados e realize análise de sensibilidade variando-os.
+
+---
+
+#### Decaimento temporal (λ)
+- **Fórmula:** `métrica × e^(−λ × dias_desde_postagem)`
+- **Meia-vida:** λ=0.01 → ~70 dias | λ=0.02 → ~35 dias | λ=0.03 → ~23 dias
+- **Recomendação:** ative quando o corpus abrange >3 meses ou quando há suspeita de viés de recência.
+""")
 
 with tab_galeria:
     st.markdown("### Galeria (fallback)")
@@ -630,6 +941,146 @@ with tab_galeria:
             if st.button("Ver", key=f"gal_{sid}"):
                 st.session_state["selected_id"] = sid
                 st.rerun()
+
+
+with tab_classif:
+    st.markdown("### 🤖 Classificação Assistida por LLM")
+    st.markdown("Usa um modelo de linguagem para sugerir a classificação. Você revisa e aprova cada sugestão.")
+
+    backend = st.radio("Backend:",
+        ["🖥️  Ollama (local, sem internet)", "☁️  Groq (nuvem, modelos open-source, gratuito)"],
+        horizontal=True, key="llm_backend")
+    use_groq = backend.startswith("☁️")
+
+    with st.expander("⚙️ Configuração", expanded=True):
+        if use_groq:
+            st.markdown("Crie sua chave em [console.groq.com](https://console.groq.com) → **API Keys → Create API Key**.")
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                groq_key = st.text_input("API Key do Groq (gsk_...)", type="password", key="groq_api_key")
+            with col2:
+                groq_model = st.selectbox("Modelo",
+                    ["llama-3.3-70b-versatile","llama-3.1-8b-instant","gemma2-9b-it"],
+                    key="groq_model", help="llama-3.3-70b-versatile é o mais recomendado.")
+            if st.button("Testar conexão Groq", key="test_groq"):
+                if not groq_key:
+                    st.warning("Insira a API Key primeiro.")
+                else:
+                    test = classify_with_groq("Teste.", "teste", "", "", groq_key, groq_model)
+                    st.success(f"✅ Groq conectado! `{groq_model}` respondendo.") if test["tipo"] else st.error(test["justificativa"])
+        else:
+            st.markdown("Instale em [ollama.com](https://ollama.com), rode `ollama pull llama3` e `ollama serve`.")
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                ollama_url = st.text_input("URL", value="http://localhost:11434", key="ollama_url")
+            with col2:
+                ollama_model = st.text_input("Modelo", value="llama3", key="ollama_model")
+            if st.button("Testar conexão Ollama", key="test_ollama"):
+                try:
+                    r = requests.get(f"{ollama_url.rstrip('/')}/api/tags", timeout=5)
+                    models_av = [m["name"] for m in r.json().get("models",[])]
+                    st.success(f"✅ Modelos: {', '.join(models_av)}") if models_av else st.warning("Sem modelos. Rode: `ollama pull llama3`")
+                except Exception:
+                    st.error("Não foi possível conectar.")
+
+    st.divider()
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        apenas_outros = st.checkbox("Mostrar apenas 'outros'", value=True)
+    with col_f2:
+        ocultar_revisados = st.checkbox("Ocultar já revisados", value=True)
+
+    if "revisados" not in st.session_state:
+        st.session_state["revisados"] = {}
+
+    df_cl = df.copy()
+    if apenas_outros: df_cl = df_cl[df_cl["_tipo"] == "outros"]
+    if ocultar_revisados: df_cl = df_cl[~df_cl["id"].astype(str).isin(st.session_state["revisados"].keys())]
+
+    st.caption(f"{len(df_cl)} registro(s) para revisar")
+
+    if df_cl.empty:
+        st.success("Todos os registros filtrados já foram revisados nesta sessão.")
+    else:
+        id_sel = st.selectbox("Selecione o registro:", df_cl["id"].astype(str).tolist(), key="classif_id_sel")
+        row_cl = df_cl[df_cl["id"].astype(str) == id_sel].iloc[0]
+
+        cL, cR = st.columns([1.2, 1.0])
+        with cL:
+            st.markdown("#### Discurso")
+            st.write(f"**ID:** {row_cl['id']}  |  **Tipo atual:** `{row_cl['_tipo']}`")
+            st.write(f"**Título:** {safe_text(row_cl.get('titulo',''), 200)}")
+            st.write(f"**Autor:** {row_cl.get('autor','')}  |  **Data:** {row_cl['_dt']}")
+            st.write(f"**Categoria:** {row_cl.get('categoria','')}  |  **Teoria:** {row_cl.get('teoria','')}")
+            st.text_area("Conteúdo", value=str(row_cl.get("conteudo","")), height=180, disabled=True, label_visibility="visible")
+            img_p = find_image(image_folder, str(row_cl["id"]))
+            if img_p: st.image(Image.open(img_p), width="stretch")
+
+        with cR:
+            st.markdown("#### Sugestão do modelo")
+            btn_label = f"🔍 Classificar com {'Groq' if use_groq else 'Ollama'}"
+            if st.button(btn_label, key="btn_classify"):
+                pronto = True
+                if use_groq and not st.session_state.get("groq_api_key","").strip():
+                    st.error("Insira a API Key do Groq."); pronto = False
+                if pronto:
+                    with st.spinner("Consultando modelo..."):
+                        resultado = (classify_with_groq if use_groq else classify_with_ollama)(
+                            texto=str(row_cl.get("conteudo","")),
+                            titulo=str(row_cl.get("titulo","")),
+                            teoria=str(row_cl.get("teoria","")),
+                            categoria=str(row_cl.get("categoria","")),
+                            **({"api_key": st.session_state["groq_api_key"],
+                                "model": st.session_state["groq_model"]} if use_groq else
+                               {"url": st.session_state.get("ollama_url","http://localhost:11434"),
+                                "model": st.session_state.get("ollama_model","llama3")})
+                        )
+                    st.session_state[f"sugestao_{id_sel}"] = resultado
+
+            sugestao = st.session_state.get(f"sugestao_{id_sel}")
+            if sugestao:
+                if sugestao["tipo"] is None:
+                    st.error(sugestao["justificativa"])
+                else:
+                    conf_icon = {"alta":"🟢","media":"🟡","baixa":"🔴"}.get(sugestao["confianca"],"⚪")
+                    st.markdown(f"**Sugerido:** `{sugestao['tipo']}` {conf_icon} confiança **{sugestao['confianca']}**")
+                    st.info(sugestao["justificativa"])
+                    st.markdown("#### Sua decisão")
+                    tipo_final = st.radio("Confirmar ou corrigir:",
+                        ["infra","supra","quase","outros"],
+                        index=["infra","supra","quase","outros"].index(sugestao["tipo"]),
+                        horizontal=True, key=f"radio_{id_sel}")
+                    nota = st.text_input("Nota do revisor (opcional):", key=f"nota_{id_sel}")
+                    if st.button("✅ Salvar decisão", key=f"salvar_{id_sel}"):
+                        st.session_state["revisados"][id_sel] = {
+                            "backend": "groq" if use_groq else "ollama",
+                            "modelo": st.session_state.get("groq_model" if use_groq else "ollama_model",""),
+                            "tipo_sugerido": sugestao["tipo"], "tipo_final": tipo_final,
+                            "justificativa_modelo": sugestao["justificativa"],
+                            "confianca": sugestao["confianca"], "nota_revisor": nota,
+                        }
+                        st.success(f"Salvo: ID {id_sel} → `{tipo_final}`")
+                        st.rerun()
+            else:
+                st.caption(f"Clique em '{btn_label}' para obter a sugestão.")
+
+    st.divider()
+    st.markdown("#### 📥 Exportar revisões")
+    revisados = st.session_state.get("revisados", {})
+    st.caption(f"{len(revisados)} registro(s) revisado(s) nesta sessão")
+    if revisados:
+        df_rev = pd.DataFrame([{"id": k, **v} for k, v in revisados.items()])
+        st.dataframe(df_rev, width="stretch")
+        df_export = df0.copy()
+        for id_rev, dec in revisados.items():
+            mask = df_export["id"].astype(str) == id_rev
+            df_export.loc[mask, "categoria"] = dec["tipo_final"]
+        st.download_button("⬇️ CSV com classificações revisadas",
+            data=df_export.to_csv(index=False, sep=sep).encode("utf-8"),
+            file_name="dataset_revisado.csv", mime="text/csv")
+        st.download_button("⬇️ Log de revisões (auditoria)",
+            data=df_rev.to_csv(index=False).encode("utf-8"),
+            file_name="log_revisoes.csv", mime="text/csv")
 
 st.caption(
     "Se você voltar a ver poucos registros, isso geralmente é filtro de tipologia. "
