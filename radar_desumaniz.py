@@ -44,18 +44,18 @@ def robust_minmax(series: pd.Series, q_lo=0.02, q_hi=0.98) -> pd.Series:
 
 
 def angle_from_cycle(dt: pd.Series, cycle: str) -> pd.Series:
-    if cycle == "Dia":
+    if cycle == "Por hora do Dia":
         seconds = dt.dt.hour * 3600 + dt.dt.minute * 60 + dt.dt.second
         frac = seconds / 86400.0
         return 2 * np.pi * frac
-    if cycle == "Semana":
+    if cycle == "Por dia da Semana":
         frac = (dt.dt.dayofweek + (dt.dt.hour / 24.0)) / 7.0
         return 2 * np.pi * frac
-    if cycle == "Mês":
+    if cycle == "Por dia do Mês":
         dim = dt.dt.days_in_month.astype(float)
         frac = ((dt.dt.day - 1) + (dt.dt.hour / 24.0)) / dim
         return 2 * np.pi * frac
-    if cycle == "Ano":
+    if cycle == "Por mês do Ano":
         doy = dt.dt.dayofyear.astype(float)
         frac = (doy - 1 + (dt.dt.hour / 24.0)) / 365.25
         return 2 * np.pi * frac
@@ -296,19 +296,19 @@ def bin_radial_band(r: pd.Series):
 
 
 def cycle_bins(cycle: str):
-    if cycle == "Dia":
+    if cycle == "Por hora do Dia":
         tickvals = [i * 360/24 for i in range(0, 24, 3)]
         ticktext = [f"{i:02d}h" for i in range(0, 24, 3)]
         label = "hora"
         unit_values = list(range(24))
         return tickvals, ticktext, label, unit_values
-    if cycle == "Semana":
+    if cycle == "Por dia da Semana":
         tickvals = [i * 360/7 for i in range(7)]
         ticktext = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
         label = "dia_semana"
         unit_values = list(range(7))
         return tickvals, ticktext, label, unit_values
-    if cycle == "Mês":
+    if cycle == "Por dia do Mês":
         tickvals = [i * 360/31 for i in range(0, 31, 5)]
         ticktext = [str(i+1) for i in range(0, 31, 5)]
         label = "dia_mes"
@@ -325,7 +325,7 @@ def cycle_bins(cycle: str):
 # App
 # =========================
 st.set_page_config(page_title="Radar crítico – desumanização", layout="wide")
-st.title("Radar crítico dos discursos: infra/supra/quase (4 faixas fixas)")
+st.title("Desumanização: infra/supra/quase (versão preliminar)")
 
 if "selected_id" not in st.session_state:
     st.session_state["selected_id"] = None
@@ -341,7 +341,7 @@ with st.sidebar:
 
     st.divider()
     st.header("Ciclo do radar")
-    cycle = st.selectbox("Ciclo", ["Dia", "Semana", "Mês", "Ano"], index=0)
+    cycle = st.selectbox("Ciclo", ["Por hora do Dia", "Por dia da Semana", "Por dia do Mês", "Por mês do Ano"], index=0)
 
     st.divider()
     st.header("Radar")
@@ -400,8 +400,34 @@ if missing:
     st.error("Colunas faltando no CSV: " + ", ".join(missing) + "\n\nVerifique separador/encoding.")
     st.stop()
 
-st.subheader("Prévia do CSV")
-st.dataframe(df0.head(12), width="stretch")
+
+
+# ── pseudonimização de autores ────────────────────────────────────────────────
+# Substitui nomes reais por pseudônimos estáveis (mesmo autor → mesmo pseudônimo
+# em qualquer sessão), usando hash SHA-256 truncado como semente.
+import hashlib, random as _random
+
+_ADJETIVOS = [
+    "Azul","Verde","Solar","Lunar","Névoa","Bruma","Coral","Âmbar","Pérola","Safira",
+    "Cinza","Dourado","Prateado","Rubro","Índigo","Ciano","Violeta","Escarlate","Jade","Opala",
+]
+_SUBSTANTIVOS = [
+    "Gavião","Corvo","Falcão","Lince","Lobo","Onça","Urso","Veado","Raposa","Tucano",
+    "Pombo","Sabiá","Albatroz","Pelicano","Garça","Cegonha","Marta","Fênix","Grifo","Sereia",
+]
+
+def _pseudonimo(nome_real: str) -> str:
+    """Gera pseudônimo estável a partir do nome real via hash SHA-256."""
+    h = int(hashlib.sha256(str(nome_real).encode("utf-8")).hexdigest(), 16)
+    adj = _ADJETIVOS[h % len(_ADJETIVOS)]
+    sub = _SUBSTANTIVOS[(h // len(_ADJETIVOS)) % len(_SUBSTANTIVOS)]
+    num = (h % 900) + 100  # número 100–999 para unicidade extra
+    return f"{adj}{sub}{num}"
+
+if "autor" in df0.columns:
+    _mapa_autor = {a: _pseudonimo(a) for a in df0["autor"].dropna().unique()}
+    df0["autor"] = df0["autor"].map(_mapa_autor).fillna("Anônimo")
+# ─────────────────────────────────────────────────────────────────────────────
 
 df = df0.copy()
 
@@ -493,6 +519,37 @@ tab_radar, tab_painel, tab_galeria, tab_classif = st.tabs(["Radar", "Painel Anal
 with tab_radar:
     st.markdown("### Radar (seleção → imagem do `id` + metadados)")
 
+    # ── Linha do tempo: lê o intervalo salvo no session_state ────────────────
+    # O slider é renderizado ABAIXO do radar; o valor da rodada anterior fica
+    # guardado em st.session_state["timeline_range"] para ser lido aqui.
+    _all_dates   = sorted(df["_dt"].dt.date.unique())
+    _all_years   = sorted({d.year for d in _all_dates})
+    _slider_dates = _all_dates
+    _n = len(_slider_dates)
+
+    def _fmt_date(d):
+        return d.strftime("%d/%m/%Y")
+
+    # Inicializa com o intervalo completo na primeira execução
+    if "timeline_range" not in st.session_state:
+        st.session_state["timeline_range"] = (0, _n - 1)
+
+    # Garante que os índices ainda são válidos se o dataset mudar
+    _saved = st.session_state["timeline_range"]
+    _idx_lo = max(0, min(_saved[0], _n - 1))
+    _idx_hi = max(0, min(_saved[1], _n - 1))
+    if _idx_lo > _idx_hi:
+        _idx_lo, _idx_hi = 0, _n - 1
+
+    # Filtra df para exibição no radar conforme o intervalo salvo
+    _date_lo = _slider_dates[_idx_lo]
+    _date_hi = _slider_dates[_idx_hi]
+    df_radar = df[
+        (df["_dt"].dt.date >= _date_lo) &
+        (df["_dt"].dt.date <= _date_hi)
+    ].copy()
+    # ─────────────────────────────────────────────────────────────────────────
+
     fig = go.Figure()
 
     bands = [0.25, 0.50, 0.75, 1.00]
@@ -515,7 +572,7 @@ with tab_radar:
         "outros": "#2ecc71",
     }
 
-    # Lookup base64 das imagens
+    # Lookup base64 das imagens (usa df completo para manter hover disponível)
     img_lookup = {}
     for _, row in df.iterrows():
         sid_i = str(row["id"])
@@ -523,10 +580,12 @@ with tab_radar:
         if ip:
             img_lookup[sid_i] = image_to_base64(ip, max_width=300)
 
+    st.caption(f"Exibindo **{len(df_radar)}** de {len(df)} eventos filtrados")
+
     np.random.seed(7)
     if show_cloud:
         for t in ["infra", "supra", "quase", "outros"]:
-            dft = df[df["_tipo"] == t]
+            dft = df_radar[df_radar["_tipo"] == t]
             if dft.empty:
                 continue
             cor = TIPO_COLOR.get(t, "#aaaaaa")
@@ -556,7 +615,7 @@ with tab_radar:
 
     if show_points:
         for t in ["infra", "supra", "quase", "outros"]:
-            dft = df[df["_tipo"] == t]
+            dft = df_radar[df_radar["_tipo"] == t]
             if dft.empty:
                 continue
             cor = TIPO_COLOR.get(t, "#aaaaaa")
@@ -595,9 +654,9 @@ with tab_radar:
             ))
 
     # Deriva no radar: linhas conectando posts consecutivos do mesmo autor
-    if show_deriva_radar and "autor" in df.columns:
-        deriva_df = compute_deriva(df)
-        for autor_d, grp_d in df.groupby("autor"):
+    if show_deriva_radar and "autor" in df_radar.columns:
+        deriva_df = compute_deriva(df_radar)
+        for autor_d, grp_d in df_radar.groupby("autor"):
             if len(grp_d) < 2:
                 continue
             grp_d = grp_d.sort_values("_dt")
@@ -624,7 +683,11 @@ with tab_radar:
                 ticktext=["Faixa 1", "Faixa 2", "Faixa 3", "Faixa 4"],
                 ticks="outside"
             ),
-            angularaxis=dict(tickmode="array", tickvals=tickvals, ticktext=ticktext)
+            angularaxis=dict(
+                tickmode="array", tickvals=tickvals, ticktext=ticktext,
+                direction="clockwise",
+                rotation=90,
+            )
         ),
         margin=dict(l=20, r=20, t=40, b=20),
     )
@@ -704,6 +767,28 @@ with tab_radar:
 
     full_html = "<div style='width:100%;height:750px'>" + fig_html + overlay_js + "</div>"
     components.html(full_html, height=760, scrolling=False)
+
+    # ── Linha do tempo: slider de intervalo posicionado abaixo do radar ──────
+    _range_val = st.slider(
+        "",
+        min_value=0,
+        max_value=_n - 1,
+        value=(_idx_lo, _idx_hi),
+        format="",
+        key="timeline_range",
+        label_visibility="collapsed",
+    )
+
+    # Marcadores de ano abaixo da barra
+    _yr_marker_cols = st.columns(len(_all_years))
+    for _yi, _yr in enumerate(_all_years):
+        _yr_first_idx = next((i for i, d in enumerate(_slider_dates) if d.year == _yr), None)
+        if _yr_first_idx is None:
+            continue
+        _in_range = _range_val[0] <= _yr_first_idx <= _range_val[1]
+        with _yr_marker_cols[_yi]:
+            st.caption(f"{'●' if _in_range else '○'} **{_yr}** — {_slider_dates[_yr_first_idx].strftime('%d/%m')}")
+    # ─────────────────────────────────────────────────────────────────────────
 
     st.markdown("---")
     st.markdown("### 🖼 Evento selecionado")
