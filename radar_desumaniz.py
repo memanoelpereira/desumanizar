@@ -530,18 +530,21 @@ with tab_radar:
     def _fmt_date(d):
         return d.strftime("%d/%m/%Y")
 
-    # Inicializa com o intervalo completo na primeira execução
+    # Inicializa com o intervalo completo na primeira execução.
+    # Só escreve no session_state se a chave ainda não existe — evita o aviso
+    # "widget created with default value but also set via Session State API".
     if "timeline_range" not in st.session_state:
         st.session_state["timeline_range"] = (0, _n - 1)
+    else:
+        _saved = st.session_state["timeline_range"]
+        _lo = max(0, min(_saved[0], _n - 1))
+        _hi = max(0, min(_saved[1], _n - 1))
+        if _lo > _hi:
+            _lo, _hi = 0, _n - 1
+        st.session_state["timeline_range"] = (_lo, _hi)
 
-    # Garante que os índices ainda são válidos se o dataset mudar
-    _saved = st.session_state["timeline_range"]
-    _idx_lo = max(0, min(_saved[0], _n - 1))
-    _idx_hi = max(0, min(_saved[1], _n - 1))
-    if _idx_lo > _idx_hi:
-        _idx_lo, _idx_hi = 0, _n - 1
+    _idx_lo, _idx_hi = st.session_state["timeline_range"]
 
-    # Filtra df para exibição no radar conforme o intervalo salvo
     _date_lo = _slider_dates[_idx_lo]
     _date_hi = _slider_dates[_idx_hi]
     df_radar = df[
@@ -768,26 +771,69 @@ with tab_radar:
     full_html = "<div style='width:100%;height:750px'>" + fig_html + overlay_js + "</div>"
     components.html(full_html, height=760, scrolling=False)
 
-    # ── Linha do tempo: slider de intervalo posicionado abaixo do radar ──────
-    _range_val = st.slider(
-        "",
+    # ── Linha do tempo ────────────────────────────────────────────────────────
+    # CSS esconde os tick-labels numéricos nativos do Streamlit (os índices
+    # 0…N que aparecem abaixo da barra) e os substitui pelos marcadores de ano.
+    st.markdown("""
+<style>
+[data-testid="stSlider"] [data-testid="stTickBar"] { display: none !important; }
+</style>
+""", unsafe_allow_html=True)
+
+    # Labels de data flutuando sobre os handles (posição proporcional ao índice)
+    _pct_lo = (_idx_lo / max(_n - 1, 1)) * 100
+    _pct_hi = (_idx_hi / max(_n - 1, 1)) * 100
+    _label_lo = _date_lo.strftime("%d/%m/%Y")
+    _label_hi = _date_hi.strftime("%d/%m/%Y")
+
+    st.markdown(f"""
+<div style="position:relative; height:22px; margin-bottom:2px; margin-top:4px;">
+  <span style="position:absolute; left:calc({_pct_lo:.1f}% - 36px);
+    font-size:11px; color:#555; white-space:nowrap;
+    background:#fff; padding:0 3px; border-radius:3px;">{_label_lo}</span>
+  <span style="position:absolute; left:calc({_pct_hi:.1f}% - 36px);
+    font-size:11px; color:#555; white-space:nowrap;
+    background:#fff; padding:0 3px; border-radius:3px;">{_label_hi}</span>
+</div>
+""", unsafe_allow_html=True)
+
+    st.slider(
+        "Linha do tempo",
         min_value=0,
         max_value=_n - 1,
-        value=(_idx_lo, _idx_hi),
-        format="",
         key="timeline_range",
         label_visibility="collapsed",
     )
 
-    # Marcadores de ano abaixo da barra
-    _yr_marker_cols = st.columns(len(_all_years))
-    for _yi, _yr in enumerate(_all_years):
-        _yr_first_idx = next((i for i, d in enumerate(_slider_dates) if d.year == _yr), None)
-        if _yr_first_idx is None:
-            continue
-        _in_range = _range_val[0] <= _yr_first_idx <= _range_val[1]
-        with _yr_marker_cols[_yi]:
-            st.caption(f"{'●' if _in_range else '○'} **{_yr}** — {_slider_dates[_yr_first_idx].strftime('%d/%m')}")
+    # Relê os índices após o slider (podem ter mudado na interação)
+    _idx_lo, _idx_hi = st.session_state["timeline_range"]
+    _date_lo = _slider_dates[_idx_lo]
+    _date_hi = _slider_dates[_idx_hi]
+
+    # Marcadores de ano posicionados proporcionalmente abaixo da barra
+    if len(_all_years) > 1:
+        _yr_marks = []
+        for _yr in _all_years:
+            _i = next((i for i, d in enumerate(_slider_dates) if d.year == _yr), None)
+            if _i is not None:
+                _yr_marks.append((_yr, _i))
+
+        _yr_html_items = ""
+        for _yr, _i in _yr_marks:
+            _pct = (_i / max(_n - 1, 1)) * 100
+            _in_range = _idx_lo <= _i <= _idx_hi
+            _color = "#1f77b4" if _in_range else "#bbb"
+            _yr_html_items += f"""
+  <span style="position:absolute; left:calc({_pct:.1f}% - 16px);
+    font-size:11px; color:{_color}; white-space:nowrap; text-align:center;">
+    {'▲' if _in_range else '▽'}<br>{_yr}
+  </span>"""
+
+        st.markdown(f"""
+<div style="position:relative; height:32px; margin-top:4px;">
+{_yr_html_items}
+</div>
+""", unsafe_allow_html=True)
     # ─────────────────────────────────────────────────────────────────────────
 
     st.markdown("---")
@@ -831,22 +877,26 @@ with tab_radar:
 
 with tab_painel:
     st.markdown("### Painel analítico (por tipo)")
+    st.caption(
+        f"Intervalo ativo: **{_date_lo.strftime('%d/%m/%Y')}** → **{_date_hi.strftime('%d/%m/%Y')}** "
+        f"({len(df_radar)} registros)"
+    )
 
     conc = (
-        df.groupby("_tipo")
+        df_radar.groupby("_tipo")
         .apply(lambda d: circular_concentration(d["_theta"].values))
         .reset_index(name="concentracao_circular")
     )
 
     # Entropia angular por tipo
     entropia_por_tipo = (
-        df.groupby("_tipo")["_theta"]
+        df_radar.groupby("_tipo")["_theta"]
         .apply(lambda s: compute_entropia_angular(s.values, n_bins=entropia_bins))
         .reset_index(name="entropia_angular")
     )
 
     resumo = (
-        df.groupby("_tipo")
+        df_radar.groupby("_tipo")
         .agg(
             eventos=("_dt", "count"),
             iv_medio=("_iv_raw", "mean"),
